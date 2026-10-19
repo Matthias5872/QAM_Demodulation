@@ -1,0 +1,2 @@
+# main.c verwendet die Callback-API des I2C-Slave-Treibers Version 2.
+CONFIG_I2C_ENABLE_SLAVE_DRIVER_VERSION_2=y

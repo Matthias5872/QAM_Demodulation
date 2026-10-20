@@ -1,21 +1,19 @@
 /********************************************************************************************* */
-// Eduboard2 ESP32-S3 - erster Empfaengertest ueber I2C
+// Eduboard2 ESP32-S3 - QAM Paketempfaenger, I2C Transporttest
 //
-// Ziel fuer diesen Stand:
-// - 6 Byte vom Sender empfangen
-// - Paket in drei 12-Bit Felder zerlegen
-// - Werte erstmal nur ueber die serielle Konsole ausgeben
+// Stand 2:
+// - I2C Empfang funktioniert
+// - START / DATA / CHECK werden aus dem Paket gelesen
+// - Gray Code wird decodiert
+// - Startsequenz und Checksumme werden kontrolliert
+// - Temperatur wird bereits berechnet
 //
-// TODO:
-// - Gray Code wieder zurueckwandeln
-// - Startsequenz / Checksumme pruefen
-// - Temperatur anzeigen
+// Anzeige kommt spaeter noch dazu.
 /********************************************************************************************* */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "esp_err.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,10 +24,15 @@
 #define PIN_I2C_SDA     2
 #define PIN_I2C_SCL     1
 #define RECEIVER_ADDR   0x42
+
+#define PACKET_START    0xA5A
 #define PACKET_BYTES    6
 
 static i2c_slave_dev_handle_t receiver;
 static QueueHandle_t receive_queue;
+
+static volatile uint32_t dropped_packets = 0;
+
 
 typedef struct
 {
@@ -38,7 +41,6 @@ typedef struct
 } received_packet_t;
 
 
-// Callback vom I2C Slave
 static bool receive_done(i2c_slave_dev_handle_t handle,
                          const i2c_slave_rx_done_event_data_t *event,
                          void *arg)
@@ -49,14 +51,17 @@ static bool receive_done(i2c_slave_dev_handle_t handle,
     received_packet_t packet = {0};
     packet.length = event->length;
 
-    // fuer den Moment interessieren nur komplette Pakete
     if(event->length == PACKET_BYTES)
     {
         memcpy(packet.bytes, event->buffer, PACKET_BYTES);
     }
 
     BaseType_t wake = pdFALSE;
-    xQueueSendFromISR(receive_queue, &packet, &wake);
+
+    if(xQueueSendFromISR(receive_queue, &packet, &wake) != pdTRUE)
+    {
+        dropped_packets++;
+    }
 
     return wake == pdTRUE;
 }
@@ -64,8 +69,7 @@ static bool receive_done(i2c_slave_dev_handle_t handle,
 
 static void receiver_init(void)
 {
-    receive_queue = xQueueCreate(5, sizeof(received_packet_t));
-    ESP_ERROR_CHECK(receive_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    receive_queue = xQueueCreate(8, sizeof(received_packet_t));
 
     i2c_slave_config_t cfg =
     {
@@ -93,11 +97,39 @@ static void receiver_init(void)
 }
 
 
+// Gray -> binaer
+static uint16_t from_gray(uint16_t gray)
+{
+    uint16_t value = gray;
+
+    while((gray >>= 1) != 0)
+    {
+        value ^= gray;
+    }
+
+    return value;
+}
+
+
+// erstmal einfache 4 Bit Checksumme
+static uint16_t checksum(uint16_t value12)
+{
+    uint16_t a = (value12 >> 8) & 0xF;
+    uint16_t b = (value12 >> 4) & 0xF;
+    uint16_t c = value12 & 0xF;
+
+    return (a + b + c) & 0xF;
+}
+
+
 static void receiver_task(void *arg)
 {
     (void)arg;
 
     received_packet_t packet;
+
+    uint32_t good = 0;
+    uint32_t bad = 0;
 
     while(1)
     {
@@ -105,27 +137,82 @@ static void receiver_task(void *arg)
         {
             if(packet.length != PACKET_BYTES)
             {
-                printf("Falsche Paketlaenge: %lu\n",
+                bad++;
+                printf("FEHLER Paketlaenge: %lu\n",
                        (unsigned long)packet.length);
                 continue;
             }
 
-            uint16_t start =
-                ((uint16_t)packet.bytes[0] << 8) |
-                packet.bytes[1];
+            uint16_t fields[3];
 
-            uint16_t data =
-                ((uint16_t)packet.bytes[2] << 8) |
-                packet.bytes[3];
+            for(int i = 0; i < 3; i++)
+            {
+                fields[i] =
+                    ((uint16_t)packet.bytes[2*i] << 8) |
+                    packet.bytes[2*i + 1];
+            }
 
-            uint16_t check =
-                ((uint16_t)packet.bytes[4] << 8) |
-                packet.bytes[5];
+            printf("Gray RX: %03X / %03X / %03X\n",
+                   fields[0],
+                   fields[1],
+                   fields[2]);
 
-            printf("Paket empfangen: %03X / %03X / %03X\n",
-                   start, data, check);
+            // sicherstellen, dass die oberen 4 Bit nicht gesetzt sind
+            if((fields[0] | fields[1] | fields[2]) & 0xF000)
+            {
+                bad++;
+                printf("FEHLER: mehr als 12 Bit\n");
+                continue;
+            }
 
-            // hier kommt als naechstes die eigentliche Decodierung rein
+            uint16_t start = from_gray(fields[0]);
+            uint16_t value = from_gray(fields[1]);
+            uint16_t check = from_gray(fields[2]);
+
+            if(start != PACKET_START)
+            {
+                bad++;
+                printf("FEHLER: Startsequenz %03X\n", start);
+                continue;
+            }
+
+            if(check != checksum(value))
+            {
+                bad++;
+                printf("FEHLER: Checksumme %X erwartet %X\n",
+                       check,
+                       checksum(value));
+                continue;
+            }
+
+            int16_t signed_value;
+
+            if(value & 0x800)
+            {
+                signed_value = (int16_t)((int)value - 4096);
+            }
+            else
+            {
+                signed_value = (int16_t)value;
+            }
+
+            // grobe Plausibilitaetspruefung vom TMP112
+            if(signed_value < -880 || signed_value > 2047)
+            {
+                bad++;
+                printf("FEHLER: Temperatur ausserhalb Bereich\n");
+                continue;
+            }
+
+            float temperature = signed_value * 0.0625f;
+
+            good++;
+
+            printf("OK: T = %.4f C   OK=%lu ERR=%lu DROP=%lu\n",
+                   temperature,
+                   (unsigned long)good,
+                   (unsigned long)bad,
+                   (unsigned long)dropped_packets);
         }
     }
 }
@@ -135,19 +222,16 @@ void app_main(void)
 {
     receiver_init();
 
-    printf("I2C Empfaenger gestartet\n");
-    printf("Adresse 0x%02X, SDA=%d, SCL=%d\n",
-           RECEIVER_ADDR,
-           PIN_I2C_SDA,
-           PIN_I2C_SCL);
+    printf("QAM Paketempfaenger - Transport noch ueber I2C\n");
+    printf("Slave 0x%02X / 100 kHz\n", RECEIVER_ADDR);
 
-    BaseType_t task_created = xTaskCreate(
-        receiver_task,
-        "receiver",
-        3072,
-        NULL,
-        5,
-        NULL
-    );
-    ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    if(xTaskCreate(receiver_task,
+                   "receiver",
+                   4096,
+                   NULL,
+                   5,
+                   NULL) != pdPASS)
+    {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
 }

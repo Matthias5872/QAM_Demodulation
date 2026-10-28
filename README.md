@@ -264,3 +264,21 @@ Temperature
 ```
 
 The I2C implementation serves as a validated baseline for the packet layer. From this point onward, the main focus of the project is the implementation and testing of the actual **QAM-4 modulation and demodulation**.
+
+### Milestone 4 – Basic ADC/QAM Demodulation
+The I2C receiver was replaced by a continuous ADC input.
+
+The first QAM demodulation implementation contains:
+- Continuous ADC sampling
+- DMA based sample acquisition
+- DC offset estimation and removal
+- Simple carrier detection
+- Sample buffering
+- Basic I/Q correlation using sine and cosine reference tables
+- QAM-4 symbol decisions
+- Reconstruction of the 36-bit packet
+- Existing Gray-code decoding and packet validation
+- Existing temperature display and error counters
+At this stage the receiver still assumes that the captured sample block is approximately aligned with the transmitted QAM symbols.
+
+No automatic phase or symbol timing correction is implemented yet.
